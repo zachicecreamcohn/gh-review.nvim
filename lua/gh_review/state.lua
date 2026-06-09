@@ -80,9 +80,9 @@ function M.get_name() return repo_name end
 
 function M.get_changed_files() return changed_files end
 
-function M.is_file_checked(path) return checked_files[path] == true end
-function M.toggle_file_checked(path)
-  checked_files[path] = not checked_files[path]
+function M.is_file_checked(path) return checked_files[path] or false end
+function M.set_file_checked(path, checked)
+  checked_files[path] = checked and true or nil
 end
 
 function M.get_pending_review_id() return pending_review_id end
@@ -131,6 +131,13 @@ function M.set_pr(data)
   end
 
   changed_files = pr.files.nodes
+
+  checked_files = {}
+  for _, f in ipairs(changed_files) do
+    if get(f, "viewerViewedState", "") == "VIEWED" then
+      checked_files[f.path] = true
+    end
+  end
 
   -- Pick up an existing pending review if one exists
   local reviews = get(pr, "reviews", nil)

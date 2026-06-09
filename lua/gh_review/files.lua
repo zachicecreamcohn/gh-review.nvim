@@ -47,10 +47,12 @@ local function render()
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
   vim.bo[bufnr].modifiable = false
 
-  -- Position cursor on first file line
   local winid = vim.fn.bufwinid(bufnr)
   if winid ~= -1 then
-    vim.api.nvim_win_set_cursor(winid, { 4, 0 })
+    local cursor = vim.api.nvim_win_get_cursor(winid)
+    local line_count = vim.api.nvim_buf_line_count(bufnr)
+    local row = math.max(4, math.min(cursor[1], line_count))
+    vim.api.nvim_win_set_cursor(winid, { row, cursor[2] })
   end
 end
 
@@ -61,10 +63,29 @@ local function toggle_checked_under_cursor()
   local files = state.get_changed_files()
   if file_idx < 1 or file_idx > #files then return end
   local path = files[file_idx].path
-  state.toggle_file_checked(path)
-  local pos = vim.api.nvim_win_get_cursor(0)
-  render()
-  vim.api.nvim_win_set_cursor(0, pos)
+
+  -- Optimistically flip locally (M.rerender keeps the cursor in place), then
+  -- sync the "Viewed" state to GitHub.
+  local checked = not state.is_file_checked(path)
+  state.set_file_checked(path, checked)
+  M.rerender()
+
+  local api = require("gh_review.api")
+  local graphql = require("gh_review.graphql")
+  local mutation = checked and graphql.MUTATION_MARK_FILE_VIEWED or graphql.MUTATION_UNMARK_FILE_VIEWED
+  local vars = { pullRequestId = state.get_pr_id(), path = path }
+  api.graphql(mutation, vars, function(result, err)
+    local data = ((result or {}).data) or {}
+    local ok = not err and (data.markFileAsViewed or data.unmarkFileAsViewed)
+    if not ok then
+      -- Revert, unless the user re-toggled this file while the request was in
+      -- flight (which would make this a stale response we'd be clobbering).
+      if state.is_file_checked(path) == checked then
+        state.set_file_checked(path, not checked)
+        M.rerender()
+      end
+    end
+  end)
 end
 
 local function open_file_under_cursor()

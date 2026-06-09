@@ -196,4 +196,108 @@ h.run_test("Files list: all change type flags rendered correctly", function()
   files.close()
 end)
 
+
+h.run_test("Files list: viewed state hydrated from viewerViewedState", function()
+  state.reset()
+  local data = fixtures.mock_pr_data()
+  data.data.repository.pullRequest.files.nodes[2].viewerViewedState = "VIEWED"
+  state.set_pr(data)
+  state.set_threads(fixtures.mock_thread_nodes())
+  state.set_repo_info("test-owner", "test-repo")
+
+  h.assert_true(state.is_file_checked("src/existing.ts"), "VIEWED file should be checked")
+  h.assert_false(state.is_file_checked("src/new_file.ts"), "non-VIEWED file should be unchecked")
+
+  files.close()
+end)
+
+-- Invoke the buffer's <Space> mapping callback directly (avoids termcode
+-- feedkeys issues in headless mode).
+local function press_space(bufnr)
+  local winid = vim.fn.bufwinid(bufnr)
+  vim.fn.win_gotoid(winid)
+  for _, m in ipairs(vim.api.nvim_buf_get_keymap(bufnr, "n")) do
+    if m.lhs == " " and m.callback then
+      m.callback()
+      return
+    end
+  end
+  error("no <Space> mapping found on files buffer")
+end
+
+-- Toggle the file on `row` via a stubbed api.graphql. With `response` the
+-- callback fires immediately; without it the callback is returned so the test
+-- can resolve it later to exercise in-flight ordering.
+local function toggle_file_row(row, response)
+  local api = require("gh_review.api")
+  local original = api.graphql
+  local captured = {}
+  api.graphql = function(_, vars, callback)
+    captured.vars = vars
+    captured.callback = callback
+    if response then callback(response.result, response.err) end
+  end
+  local bufnr = state.get_files_bufnr()
+  vim.api.nvim_win_set_cursor(vim.fn.bufwinid(bufnr), { row, 0 })
+  press_space(bufnr)
+  api.graphql = original
+  return captured
+end
+h.run_test("Files list: toggle marks file viewed and persists on success", function()
+  state.reset()
+  state.set_pr(fixtures.mock_pr_data())
+  state.set_threads(fixtures.mock_thread_nodes())
+  state.set_repo_info("test-owner", "test-repo")
+  files.open()
+
+  local captured = toggle_file_row(4, { result = { data = { markFileAsViewed = { pullRequest = { id = "PR_abc123" } } } } })
+
+  h.assert_equal("src/new_file.ts", captured.vars.path, "mutation sent for the file under cursor")
+  h.assert_equal("PR_abc123", captured.vars.pullRequestId, "mutation includes PR id")
+  h.assert_true(state.is_file_checked("src/new_file.ts"), "file stays checked after successful mutation")
+
+  local lines = vim.api.nvim_buf_get_lines(state.get_files_bufnr(), 0, -1, false)
+  h.assert_match("^%[x%]", lines[4], "checkbox shows checked after success")
+  h.assert_match("^%[ %]", lines[5], "other files stay unchecked")
+
+  files.close()
+end)
+
+h.run_test("Files list: toggle reverts optimistic state on failure", function()
+  state.reset()
+  state.set_pr(fixtures.mock_pr_data())
+  state.set_threads(fixtures.mock_thread_nodes())
+  state.set_repo_info("test-owner", "test-repo")
+  files.open()
+
+  toggle_file_row(4, { result = nil, err = "GraphQL error: boom" })
+
+  h.assert_false(state.is_file_checked("src/new_file.ts"), "failed mutation reverts to unchecked")
+  local lines = vim.api.nvim_buf_get_lines(state.get_files_bufnr(), 0, -1, false)
+  h.assert_match("^%[ %]", lines[4], "checkbox shows unchecked after failure")
+
+  files.close()
+end)
+
+h.run_test("Files list: stale in-flight failure does not clobber newer toggle", function()
+  state.reset()
+  state.set_pr(fixtures.mock_pr_data())
+  state.set_threads(fixtures.mock_thread_nodes())
+  state.set_repo_info("test-owner", "test-repo")
+  files.open()
+
+  -- Leave the first toggle's request in flight, then toggle again before it
+  -- resolves; the stale first failure must not clobber the newer state.
+  local first = toggle_file_row(4)
+  h.assert_true(state.is_file_checked("src/new_file.ts"), "file checked after first toggle")
+
+  toggle_file_row(4)
+  h.assert_false(state.is_file_checked("src/new_file.ts"), "file unchecked after second toggle")
+
+  first.callback(nil, "boom")
+  h.assert_false(state.is_file_checked("src/new_file.ts"), "stale failure must not clobber newer state")
+
+  files.close()
+end)
+
 h.write_results("/tmp/gh_review_test_ui.txt")
